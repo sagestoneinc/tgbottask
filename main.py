@@ -281,14 +281,33 @@ def build_checklist_text(title: str, items: list[dict], done_map: dict[int, bool
     return "\n".join(lines)
 
 
-def checklist_keyboard() -> InlineKeyboardMarkup:
-    # Compact + noticeable; 2 per row
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Update", callback_data="ck_open"),
-         InlineKeyboardButton("➕ Add", callback_data="task_add")],
-        [InlineKeyboardButton("🔗 Links", callback_data="links"),
-         InlineKeyboardButton("⏰ Snooze 1h", callback_data="ck_snooze1")],
+def short_label(text: str, max_len: int = 44) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def checklist_keyboard(items: list[dict] | None = None, done_map: dict[int, bool] | None = None) -> InlineKeyboardMarkup:
+    done_map = done_map or {}
+    rows = []
+
+    # Telegram-like checklist controls: one tap to toggle each item.
+    if items:
+        for idx, it in enumerate(items, start=1):
+            is_done = done_map.get(it["id"], False)
+            prefix = "✅" if is_done else "☐"
+            label = short_label(it["label"])
+            rows.append([InlineKeyboardButton(f"{prefix} {idx}. {label}", callback_data=f"ck_t:{it['id']}")])
+
+    # Utility actions
+    rows.extend([
+        [InlineKeyboardButton("➕ Add", callback_data="task_add"),
+         InlineKeyboardButton("🔗 Links", callback_data="links")],
+        [InlineKeyboardButton("⏰ Snooze 1h", callback_data="ck_snooze1")],
     ])
+
+    return InlineKeyboardMarkup(rows)
 
 
 def picker_keyboard(items: list[dict], done_map: dict[int, bool]) -> InlineKeyboardMarkup:
@@ -347,13 +366,17 @@ async def post_or_update_checklist(context: ContextTypes.DEFAULT_TYPE, chat_id: 
                 chat_id=chat_id,
                 message_id=int(msg_id),
                 text=text,
-                reply_markup=checklist_keyboard(),
+                reply_markup=checklist_keyboard(items, done_map),
             )
             return
         except Exception:
             pass
 
-    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=checklist_keyboard())
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=checklist_keyboard(items, done_map),
+    )
     update_chat_state(chat_id, checklist_msg_id=sent.message_id, checklist_msg_date=day)
 
 
@@ -589,7 +612,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_chat_state(chat_id, checklist_msg_id=q.message.message_id, checklist_msg_date=day)
 
         await q.answer()
-        await q.edit_message_reply_markup(reply_markup=picker_keyboard(items, done_map))
+        await q.edit_message_reply_markup(reply_markup=checklist_keyboard(items, done_map))
         return
 
     # Back to main keyboard (and refresh text)
@@ -603,7 +626,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = build_checklist_text(title, items, done_map)
 
         await q.answer()
-        await q.edit_message_text(text=text, reply_markup=checklist_keyboard())
+        await q.edit_message_text(text=text, reply_markup=checklist_keyboard(items, done_map))
         return
 
     # Toggle item and refresh checklist (stay in picker mode)
@@ -620,7 +643,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = build_checklist_text(title, items, done_map)
 
         await q.answer()
-        await q.edit_message_text(text=text, reply_markup=picker_keyboard(items, done_map))
+        await q.edit_message_text(text=text, reply_markup=checklist_keyboard(items, done_map))
         return
 
     # Add task button
