@@ -620,7 +620,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN in .env")
 
@@ -640,10 +640,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_task))
 
-    # Polling is simplest. For production, switch to webhooks.
-    await app.run_polling()
-
+    # IMPORTANT: do NOT await this, and do NOT wrap it in asyncio.run
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
