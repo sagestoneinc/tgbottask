@@ -1,4 +1,4 @@
-\
+import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -16,6 +16,12 @@ from telegram.ext import (
 )
 
 load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "America/New_York")  # Eastern Time (EST/EDT)
@@ -44,6 +50,34 @@ QUICK_LINKS = [
 
 # In-memory pending confirmations: (chat_id, user_id) -> task_text
 PENDING = {}
+
+
+def normalize_webhook_path(raw_path: str, token: str) -> str:
+    """
+    Return a safe webhook path without leading/trailing slash.
+    Defaults to a token-based path when no path is provided.
+    """
+    path = (raw_path or f"telegram/{token}").strip()
+    return path.strip("/")
+
+
+def derive_webhook_url(path: str) -> str:
+    """
+    Build webhook URL from explicit WEBHOOK_URL or Railway public domain.
+    """
+    explicit = os.getenv("WEBHOOK_URL", "").strip()
+    if explicit:
+        return explicit
+
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().rstrip("/")
+    if not domain:
+        return ""
+
+    if domain.startswith("http://") or domain.startswith("https://"):
+        base = domain
+    else:
+        base = f"https://{domain}"
+    return f"{base}/{path}"
 
 
 def conn():
@@ -620,6 +654,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception while processing update: %s", context.error, exc_info=context.error)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN in .env")
@@ -639,9 +677,36 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_task))
+    app.add_error_handler(on_error)
 
+    mode = os.getenv("BOT_MODE", "").strip().lower()
+    webhook_path = normalize_webhook_path(os.getenv("WEBHOOK_PATH", ""), BOT_TOKEN)
+    webhook_url = derive_webhook_url(webhook_path)
+    use_webhook = mode == "webhook" or (mode == "" and bool(webhook_url))
+
+    if use_webhook:
+        if not webhook_url:
+            raise RuntimeError(
+                "Webhook mode requires WEBHOOK_URL or RAILWAY_PUBLIC_DOMAIN."
+            )
+
+        port = int(os.getenv("PORT", "8080"))
+        secret_token = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
+        logger.info("Starting bot in webhook mode on port %s path=/%s", port, webhook_path)
+        # IMPORTANT: do NOT await this, and do NOT wrap it in asyncio.run
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            secret_token=secret_token,
+            drop_pending_updates=True,
+        )
+        return
+
+    logger.info("Starting bot in polling mode")
     # IMPORTANT: do NOT await this, and do NOT wrap it in asyncio.run
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
