@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
+from html import escape
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -154,6 +155,48 @@ def conn():
     return con
 
 
+def ensure_column(con: sqlite3.Connection, table: str, column: str, definition: str):
+    cols = {
+        row["name"]
+        for row in con.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in cols:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def user_display_name(user) -> str:
+    if not user:
+        return "Unknown"
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    full_name = " ".join(
+        p for p in [getattr(user, "first_name", ""), getattr(user, "last_name", "")]
+        if p
+    ).strip()
+    return full_name or f"user_{getattr(user, 'id', 'unknown')}"
+
+
+def mention_html(user_id: int | None, display_name: str | None) -> str:
+    label = escape((display_name or "Unknown").strip() or "Unknown")
+    if user_id:
+        return f'<a href="tg://user?id={user_id}">{label}</a>'
+    return label
+
+
+def format_local_time(iso_dt: str | None, tz_name: str) -> str:
+    if not iso_dt:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_dt)
+        # Existing data stores UTC timestamps without tzinfo.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        local = dt.astimezone(ZoneInfo(tz_name))
+        return local.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return ""
+
+
 def init_db():
     with conn() as con:
         con.execute("""
@@ -195,6 +238,7 @@ def init_db():
             day TEXT NOT NULL,
             done INTEGER NOT NULL DEFAULT 0,
             done_by INTEGER NULL,
+            done_by_name TEXT NULL,
             done_at TEXT NULL,
             PRIMARY KEY(checklist_id, item_id, day)
         )
@@ -206,9 +250,22 @@ def init_db():
             chat_id INTEGER NOT NULL,
             text TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'open',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            created_by INTEGER NULL,
+            created_by_name TEXT NULL,
+            done_by INTEGER NULL,
+            done_by_name TEXT NULL,
+            done_at TEXT NULL
         )
         """)
+
+        # Backward-compatible migrations for existing DBs.
+        ensure_column(con, "checklist_done", "done_by_name", "TEXT NULL")
+        ensure_column(con, "tasks", "created_by", "INTEGER NULL")
+        ensure_column(con, "tasks", "created_by_name", "TEXT NULL")
+        ensure_column(con, "tasks", "done_by", "INTEGER NULL")
+        ensure_column(con, "tasks", "done_by_name", "TEXT NULL")
+        ensure_column(con, "tasks", "done_at", "TEXT NULL")
 
 
 def get_or_create_chat_state(chat_id: int):
@@ -303,16 +360,20 @@ def get_checklist_items(checklist_id: int):
     return [dict(r) for r in rows]
 
 
-def get_done_map(checklist_id: int, day: str) -> dict[int, bool]:
+def get_done_details(checklist_id: int, day: str) -> dict[int, dict]:
     with conn() as con:
         rows = con.execute(
-            "SELECT item_id, done FROM checklist_done WHERE checklist_id=? AND day=?",
+            "SELECT item_id, done, done_by, done_by_name, done_at FROM checklist_done WHERE checklist_id=? AND day=?",
             (checklist_id, day),
         ).fetchall()
-    return {int(r["item_id"]): bool(r["done"]) for r in rows}
+    return {int(r["item_id"]): dict(r) for r in rows}
 
 
-def toggle_done(checklist_id: int, item_id: int, day: str, user_id: int) -> bool:
+def done_map_from_details(done_details: dict[int, dict]) -> dict[int, bool]:
+    return {item_id: bool(detail.get("done")) for item_id, detail in done_details.items()}
+
+
+def toggle_done(checklist_id: int, item_id: int, day: str, user_id: int, user_name: str) -> bool:
     now = datetime.utcnow().isoformat()
     with conn() as con:
         row = con.execute(
@@ -322,30 +383,53 @@ def toggle_done(checklist_id: int, item_id: int, day: str, user_id: int) -> bool
 
         if not row:
             con.execute(
-                "INSERT INTO checklist_done(checklist_id, item_id, day, done, done_by, done_at) VALUES (?, ?, ?, 1, ?, ?)",
-                (checklist_id, item_id, day, user_id, now),
+                (
+                    "INSERT INTO checklist_done(checklist_id, item_id, day, done, done_by, done_by_name, done_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?)"
+                ),
+                (checklist_id, item_id, day, user_id, user_name, now),
             )
             return True
 
         new_done = 0 if int(row["done"]) == 1 else 1
         con.execute(
-            "UPDATE checklist_done SET done=?, done_by=?, done_at=? WHERE checklist_id=? AND item_id=? AND day=?",
-            (new_done, user_id, now, checklist_id, item_id, day),
+            (
+                "UPDATE checklist_done SET done=?, done_by=?, done_by_name=?, done_at=? "
+                "WHERE checklist_id=? AND item_id=? AND day=?"
+            ),
+            (new_done, user_id, user_name, now, checklist_id, item_id, day),
         )
         return bool(new_done)
 
 
-def build_checklist_text(title: str, items: list[dict], done_map: dict[int, bool]) -> str:
+def build_checklist_text(
+    title: str,
+    items: list[dict],
+    done_map: dict[int, bool],
+    done_details: dict[int, dict],
+    tz_name: str,
+) -> str:
     total = len(items)
     done_count = sum(1 for it in items if done_map.get(it["id"], False))
 
-    lines = [f"📝 {title}", "Group Checklist"]
+    lines = [f"📝 <b>{escape(title)}</b>", "Group Checklist"]
     for it in items:
+        item_label = escape(it["label"])
         is_done = done_map.get(it["id"], False)
-        prefix = "✅" if is_done else "◯"
-        lines.append(f"{prefix}  {it['label']}")
+        if not is_done:
+            lines.append(f"◯  {item_label}")
+            continue
+
+        detail = done_details.get(it["id"], {})
+        actor = mention_html(detail.get("done_by"), detail.get("done_by_name"))
+        done_time = format_local_time(detail.get("done_at"), tz_name)
+        if done_time:
+            lines.append(f"✅  {item_label} <i>({actor} · {done_time})</i>")
+        else:
+            lines.append(f"✅  {item_label} <i>({actor})</i>")
     lines.append("")
-    lines.append(f"{done_count} of {total} completed")
+    lines.append(f"<b>{done_count} of {total} completed</b>")
+    lines.append("Tap any item button to toggle.")
     return "\n".join(lines)
 
 
@@ -422,8 +506,9 @@ async def post_or_update_checklist(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
     title = get_checklist_title(checklist_id)
     items = get_checklist_items(checklist_id)
-    done_map = get_done_map(checklist_id, day)
-    text = build_checklist_text(title, items, done_map)
+    done_details = get_done_details(checklist_id, day)
+    done_map = done_map_from_details(done_details)
+    text = build_checklist_text(title, items, done_map, done_details, st["tz"])
 
     msg_id = st.get("checklist_msg_id")
     msg_day = st.get("checklist_msg_date")
@@ -434,6 +519,7 @@ async def post_or_update_checklist(context: ContextTypes.DEFAULT_TYPE, chat_id: 
                 chat_id=chat_id,
                 message_id=int(msg_id),
                 text=text,
+                parse_mode="HTML",
                 reply_markup=checklist_keyboard(items, done_map),
             )
             return
@@ -443,6 +529,7 @@ async def post_or_update_checklist(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
+        parse_mode="HTML",
         reply_markup=checklist_keyboard(items, done_map),
     )
     update_chat_state(chat_id, checklist_msg_id=sent.message_id, checklist_msg_date=day)
@@ -500,7 +587,10 @@ async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with conn() as con:
         rows = con.execute(
-            "SELECT id, text FROM tasks WHERE chat_id=? AND status='open' ORDER BY id DESC LIMIT 25",
+            (
+                "SELECT id, text, created_by, created_by_name "
+                "FROM tasks WHERE chat_id=? AND status='open' ORDER BY id DESC LIMIT 25"
+            ),
             (chat_id,),
         ).fetchall()
 
@@ -510,13 +600,16 @@ async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📌 Open ad-hoc tasks:"]
     for r in rows:
-        lines.append(f"• #{r['id']} {r['text']}")
+        owner = mention_html(r["created_by"], r["created_by_name"])
+        lines.append(f"• #{r['id']} {escape(r['text'])} <i>(opened by {owner})</i>")
     lines.append("\nUse /taskdone <id> to complete.")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def taskdone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    actor = update.effective_user
+    actor_name = user_display_name(actor)
     if not context.args:
         await update.message.reply_text("Usage: /taskdone <id>")
         return
@@ -527,11 +620,35 @@ async def taskdone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     with conn() as con:
-        cur = con.execute(
-            "UPDATE tasks SET status='done' WHERE chat_id=? AND id=? AND status='open'",
+        task = con.execute(
+            (
+                "SELECT id, text, created_by, created_by_name FROM tasks "
+                "WHERE chat_id=? AND id=? AND status='open'"
+            ),
             (chat_id, task_id),
-        )
-    await update.message.reply_text("✅ Task completed." if cur.rowcount else "Couldn’t find that open task.")
+        ).fetchone()
+
+        if task:
+            now = datetime.utcnow().isoformat()
+            con.execute(
+                (
+                    "UPDATE tasks SET status='done', done_by=?, done_by_name=?, done_at=? "
+                    "WHERE chat_id=? AND id=?"
+                ),
+                (actor.id, actor_name, now, chat_id, task_id),
+            )
+
+    if not task:
+        await update.message.reply_text("Couldn’t find that open task.")
+        return
+
+    lines = [
+        f"✅ Task #{task_id} completed by {mention_html(actor.id, actor_name)}",
+        f"📝 {escape(task['text'])}",
+    ]
+    opener = mention_html(task["created_by"], task["created_by_name"])
+    lines.append(f"Opened by: {opener}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def handoff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -543,34 +660,67 @@ async def handoff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     title = get_checklist_title(checklist_id)
     items = get_checklist_items(checklist_id)
-    done_map = get_done_map(checklist_id, day)
+    done_details = get_done_details(checklist_id, day)
+    done_map = done_map_from_details(done_details)
 
-    done_items = [it["label"] for it in items if done_map.get(it["id"], False)]
-    open_items = [it["label"] for it in items if not done_map.get(it["id"], False)]
+    done_items = [it for it in items if done_map.get(it["id"], False)]
+    open_items = [it for it in items if not done_map.get(it["id"], False)]
 
     with conn() as con:
         open_tasks = con.execute(
-            "SELECT id, text FROM tasks WHERE chat_id=? AND status='open' ORDER BY id DESC LIMIT 10",
+            (
+                "SELECT id, text, created_by, created_by_name, created_at "
+                "FROM tasks WHERE chat_id=? AND status='open' ORDER BY id DESC LIMIT 20"
+            ),
+            (chat_id,),
+        ).fetchall()
+        done_tasks = con.execute(
+            (
+                "SELECT id, text, created_by, created_by_name, done_by, done_by_name, done_at "
+                "FROM tasks WHERE chat_id=? AND status='done' ORDER BY id DESC LIMIT 20"
+            ),
             (chat_id,),
         ).fetchall()
 
-    lines = [f"🧾 Handoff — {title} ({day})", ""]
+    lines = [f"🧾 <b>Handoff — {escape(title)} ({day})</b>", ""]
     lines.append("✅ Completed checklist items:")
-    lines += [f"• {t}" for t in (done_items or ["(none)"])]
+    if done_items:
+        for it in done_items:
+            detail = done_details.get(it["id"], {})
+            who = mention_html(detail.get("done_by"), detail.get("done_by_name"))
+            at = format_local_time(detail.get("done_at"), st["tz"])
+            suffix = f" <i>({who}{' · ' + at if at else ''})</i>"
+            lines.append(f"• {escape(it['label'])}{suffix}")
+    else:
+        lines.append("• (none)")
 
     lines.append("")
     lines.append("⏳ Remaining checklist items:")
-    lines += [f"• {t}" for t in (open_items or ["(none)"])]
+    if open_items:
+        lines += [f"• {escape(it['label'])}" for it in open_items]
+    else:
+        lines.append("• (none)")
 
     lines.append("")
     lines.append("📌 Open ad-hoc tasks:")
     if open_tasks:
         for r in open_tasks:
-            lines.append(f"• #{r['id']} {r['text']}")
+            who = mention_html(r["created_by"], r["created_by_name"])
+            lines.append(f"• #{r['id']} {escape(r['text'])} <i>(opened by {who})</i>")
     else:
         lines.append("• (none)")
 
-    await update.message.reply_text("\n".join(lines))
+    lines.append("")
+    lines.append("✅ Recently completed ad-hoc tasks:")
+    if done_tasks:
+        for r in done_tasks:
+            who = mention_html(r["done_by"], r["done_by_name"])
+            at = format_local_time(r["done_at"], st["tz"])
+            lines.append(f"• #{r['id']} {escape(r['text'])} <i>(done by {who}{' · ' + at if at else ''})</i>")
+    else:
+        lines.append("• (none)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -674,7 +824,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         checklist_id = st.get("checklist_id") or ensure_default_checklist(chat_id)
         day = local_day(st)
         items = get_checklist_items(checklist_id)
-        done_map = get_done_map(checklist_id, day)
+        done_details = get_done_details(checklist_id, day)
+        done_map = done_map_from_details(done_details)
 
         # Remember which message is the main checklist message
         update_chat_state(chat_id, checklist_msg_id=q.message.message_id, checklist_msg_date=day)
@@ -690,28 +841,59 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         title = get_checklist_title(checklist_id)
         items = get_checklist_items(checklist_id)
-        done_map = get_done_map(checklist_id, day)
-        text = build_checklist_text(title, items, done_map)
+        done_details = get_done_details(checklist_id, day)
+        done_map = done_map_from_details(done_details)
+        text = build_checklist_text(title, items, done_map, done_details, st["tz"])
 
         await q.answer()
-        await q.edit_message_text(text=text, reply_markup=checklist_keyboard(items, done_map))
+        try:
+            await q.edit_message_text(
+                text=text,
+                parse_mode="HTML",
+                reply_markup=checklist_keyboard(items, done_map),
+            )
+        except Exception:
+            # Fallback: post a fresh checklist message if editing fails.
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=checklist_keyboard(items, done_map),
+            )
+            update_chat_state(chat_id, checklist_msg_id=sent.message_id, checklist_msg_date=day)
         return
 
     # Toggle item and refresh checklist (stay in picker mode)
     if data.startswith("ck_t:"):
+        await q.answer("Updating checklist...")
         item_id = int(data.split(":")[1])
         checklist_id = st.get("checklist_id") or ensure_default_checklist(chat_id)
         day = local_day(st)
+        actor_name = user_display_name(q.from_user)
 
-        toggle_done(checklist_id, item_id, day, user_id)
+        toggle_done(checklist_id, item_id, day, user_id, actor_name)
 
         title = get_checklist_title(checklist_id)
         items = get_checklist_items(checklist_id)
-        done_map = get_done_map(checklist_id, day)
-        text = build_checklist_text(title, items, done_map)
+        done_details = get_done_details(checklist_id, day)
+        done_map = done_map_from_details(done_details)
+        text = build_checklist_text(title, items, done_map, done_details, st["tz"])
 
-        await q.answer()
-        await q.edit_message_text(text=text, reply_markup=checklist_keyboard(items, done_map))
+        try:
+            await q.edit_message_text(
+                text=text,
+                parse_mode="HTML",
+                reply_markup=checklist_keyboard(items, done_map),
+            )
+        except Exception:
+            # Fallback: post a fresh checklist message if editing fails.
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=checklist_keyboard(items, done_map),
+            )
+            update_chat_state(chat_id, checklist_msg_id=sent.message_id, checklist_msg_date=day)
         return
 
     # Add task button
@@ -734,12 +916,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now = datetime.utcnow().isoformat()
         with conn() as con:
-            con.execute(
-                "INSERT INTO tasks(chat_id, text, created_at) VALUES (?, ?, ?)",
-                (chat_id, pending, now),
+            cur = con.execute(
+                (
+                    "INSERT INTO tasks(chat_id, text, created_at, created_by, created_by_name) "
+                    "VALUES (?, ?, ?, ?, ?)"
+                ),
+                (chat_id, pending, now, user_id, user_display_name(q.from_user)),
             )
+            task_id = int(cur.lastrowid)
         PENDING.pop((chat_id, user_id), None)
         await q.answer("Saved.")
+        owner = mention_html(user_id, user_display_name(q.from_user))
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Saved task #{task_id}: {escape(pending)}\nOwner: {owner}",
+            parse_mode="HTML",
+        )
         return
 
     await q.answer()
