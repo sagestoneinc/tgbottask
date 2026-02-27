@@ -60,11 +60,13 @@ RAILWAY_PUBLIC_DOMAIN=<your-service-domain>
 Optional hardening/config:
 
 ```bash
-WEBHOOK_PATH=telegram/<your_bot_token>
-WEBHOOK_SECRET_TOKEN=<long-random-secret>
+WEBHOOK_PATH=telegram/webhook
+WEBHOOK_SECRET_TOKEN=my_super_secret_2026
 # If you prefer explicit URL instead of RAILWAY_PUBLIC_DOMAIN:
 # WEBHOOK_URL=https://<your-domain>/<webhook-path>
 ```
+
+`WEBHOOK_SECRET_TOKEN` can only contain: `A-Z`, `a-z`, `0-9`, `_`, `-`.
 
 3. Use start command:
 

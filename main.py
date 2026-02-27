@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -50,14 +51,15 @@ QUICK_LINKS = [
 
 # In-memory pending confirmations: (chat_id, user_id) -> task_text
 PENDING = {}
+WEBHOOK_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
 
-def normalize_webhook_path(raw_path: str, token: str) -> str:
+def normalize_webhook_path(raw_path: str) -> str:
     """
     Return a safe webhook path without leading/trailing slash.
-    Defaults to a token-based path when no path is provided.
+    Defaults to a generic webhook path when no path is provided.
     """
-    path = (raw_path or f"telegram/{token}").strip()
+    path = (raw_path or "telegram/webhook").strip()
     return path.strip("/")
 
 
@@ -78,6 +80,32 @@ def derive_webhook_url(path: str) -> str:
     else:
         base = f"https://{domain}"
     return f"{base}/{path}"
+
+
+def normalize_webhook_secret_token(raw_secret: str) -> str | None:
+    """
+    Normalize and validate webhook secret token.
+    Telegram only allows A-Z, a-z, 0-9, _ and - (1..256 chars).
+    """
+    secret = (raw_secret or "").strip()
+    if not secret:
+        return None
+
+    # Railway users sometimes paste quoted values.
+    if (secret.startswith('"') and secret.endswith('"')) or (secret.startswith("'") and secret.endswith("'")):
+        secret = secret[1:-1].strip()
+
+    if not secret:
+        return None
+
+    if not WEBHOOK_SECRET_TOKEN_RE.fullmatch(secret):
+        logger.warning(
+            "Ignoring WEBHOOK_SECRET_TOKEN due to invalid characters. "
+            "Allowed characters: A-Z a-z 0-9 _ -"
+        )
+        return None
+
+    return secret
 
 
 def conn():
@@ -703,7 +731,7 @@ def main():
     app.add_error_handler(on_error)
 
     mode = os.getenv("BOT_MODE", "").strip().lower()
-    webhook_path = normalize_webhook_path(os.getenv("WEBHOOK_PATH", ""), BOT_TOKEN)
+    webhook_path = normalize_webhook_path(os.getenv("WEBHOOK_PATH", ""))
     webhook_url = derive_webhook_url(webhook_path)
     use_webhook = mode == "webhook" or (mode == "" and bool(webhook_url))
 
@@ -714,7 +742,7 @@ def main():
             )
 
         port = int(os.getenv("PORT", "8080"))
-        secret_token = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
+        secret_token = normalize_webhook_secret_token(os.getenv("WEBHOOK_SECRET_TOKEN", ""))
         logger.info("Starting bot in webhook mode on port %s path=/%s", port, webhook_path)
         # IMPORTANT: do NOT await this, and do NOT wrap it in asyncio.run
         app.run_webhook(
