@@ -54,6 +54,46 @@ PENDING = {}
 WEBHOOK_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 
 
+class SecretRedactionFilter(logging.Filter):
+    def __init__(self, secret: str):
+        super().__init__()
+        self.secret = secret
+
+    def _redact(self, value):
+        if isinstance(value, str):
+            return value.replace(self.secret, "<redacted>")
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self.secret:
+            return True
+
+        record.msg = self._redact(record.msg)
+
+        if record.args:
+            if isinstance(record.args, tuple):
+                record.args = tuple(self._redact(arg) for arg in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: self._redact(v) for k, v in record.args.items()}
+
+        return True
+
+
+def configure_secure_logging(secret: str):
+    # Avoid verbose third-party request logs that include token-bearing URLs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    if not secret:
+        return
+
+    token_filter = SecretRedactionFilter(secret)
+    root_logger = logging.getLogger()
+    root_logger.addFilter(token_filter)
+    for handler in root_logger.handlers:
+        handler.addFilter(token_filter)
+
+
 def normalize_webhook_path(raw_path: str) -> str:
     """
     Return a safe webhook path without leading/trailing slash.
@@ -713,6 +753,7 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN in .env")
 
+    configure_secure_logging(BOT_TOKEN)
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
