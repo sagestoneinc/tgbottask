@@ -109,30 +109,50 @@ def derive_webhook_url(path: str) -> str:
     """
     Build webhook URL from explicit WEBHOOK_URL or Railway public domain.
     """
-    explicit = os.getenv("WEBHOOK_URL", "").strip()
-    if explicit:
+    target_path = f"/{path}"
+
+    explicit_raw = os.getenv("WEBHOOK_URL", "").strip()
+    if explicit_raw:
+        explicit = explicit_raw
         if not explicit.startswith("http://") and not explicit.startswith("https://"):
-            explicit = f"https://{explicit}"
+            explicit = f"https://{explicit.lstrip('/')}"
 
         parsed = urlparse(explicit)
-        target_path = f"/{path}"
-        if parsed.path.rstrip("/") != target_path:
-            logger.warning(
-                "WEBHOOK_URL path did not match WEBHOOK_PATH; forcing path to %s",
-                target_path,
-            )
-            parsed = parsed._replace(path=target_path, params="", query="", fragment="")
-        return urlunparse(parsed)
+        if parsed.netloc:
+            if parsed.path.rstrip("/") != target_path:
+                logger.warning(
+                    "WEBHOOK_URL path did not match WEBHOOK_PATH; forcing path to %s",
+                    target_path,
+                )
+                parsed = parsed._replace(path=target_path, params="", query="", fragment="")
+            return urlunparse(parsed)
+
+        logger.warning(
+            "Ignoring invalid WEBHOOK_URL=%r (missing host). Falling back to Railway domain variables.",
+            explicit_raw,
+        )
 
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().rstrip("/")
+    if not domain:
+        # Some Railway setups expose a full URL-like value in this var.
+        static_url = os.getenv("RAILWAY_STATIC_URL", "").strip().rstrip("/")
+        if static_url:
+            parsed = urlparse(static_url if "://" in static_url else f"https://{static_url}")
+            if parsed.netloc:
+                base = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+                return f"{base}{target_path}"
+
     if not domain:
         return ""
 
     if domain.startswith("http://") or domain.startswith("https://"):
-        base = domain
+        parsed = urlparse(domain)
+        if not parsed.netloc:
+            return ""
+        base = f"{parsed.scheme}://{parsed.netloc}"
     else:
         base = f"https://{domain}"
-    return f"{base}/{path}"
+    return f"{base}{target_path}"
 
 
 def normalize_webhook_secret_token(raw_secret: str) -> str | None:
@@ -983,7 +1003,10 @@ def main():
     if use_webhook:
         if not webhook_url:
             raise RuntimeError(
-                "Webhook mode requires WEBHOOK_URL or RAILWAY_PUBLIC_DOMAIN."
+                "Webhook mode requires a valid public URL. "
+                "Set WEBHOOK_URL to a full https URL (for example: "
+                "https://your-app.up.railway.app/telegram/webhook) "
+                "or provide RAILWAY_PUBLIC_DOMAIN/RAILWAY_STATIC_URL."
             )
 
         port = int(os.getenv("PORT", "8080"))
