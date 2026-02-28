@@ -4,6 +4,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
+from urllib.parse import urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -110,7 +111,18 @@ def derive_webhook_url(path: str) -> str:
     """
     explicit = os.getenv("WEBHOOK_URL", "").strip()
     if explicit:
-        return explicit
+        if not explicit.startswith("http://") and not explicit.startswith("https://"):
+            explicit = f"https://{explicit}"
+
+        parsed = urlparse(explicit)
+        target_path = f"/{path}"
+        if parsed.path.rstrip("/") != target_path:
+            logger.warning(
+                "WEBHOOK_URL path did not match WEBHOOK_PATH; forcing path to %s",
+                target_path,
+            )
+            parsed = parsed._replace(path=target_path, params="", query="", fragment="")
+        return urlunparse(parsed)
 
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().rstrip("/")
     if not domain:
@@ -976,7 +988,13 @@ def main():
 
         port = int(os.getenv("PORT", "8080"))
         secret_token = normalize_webhook_secret_token(os.getenv("WEBHOOK_SECRET_TOKEN", ""))
-        logger.info("Starting bot in webhook mode on port %s path=/%s", port, webhook_path)
+        webhook_host = urlparse(webhook_url).netloc
+        logger.info(
+            "Starting bot in webhook mode on port %s host=%s path=/%s",
+            port,
+            webhook_host or "(unknown)",
+            webhook_path,
+        )
         # IMPORTANT: do NOT await this, and do NOT wrap it in asyncio.run
         app.run_webhook(
             listen="0.0.0.0",
